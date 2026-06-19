@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""
+web_app.py  —  ITC System Scanner  (Client-Scan Edition)
+=========================================================
+Central web server.  Runs ONCE on a server/admin machine.
+Client PCs run  client_agent.py  to register themselves.
+
+When a browser opens this page and clicks "Scan This PC",
+the scan runs ON THAT CLIENT PC — not on this server.
+
+HOW IT WORKS
+------------
+  Server machine:   python web_app.py            (runs always-on)
+  Client PC:        python client_agent.py        (run on each PC to scan)
+  Browser:          http://<server-ip>:5051       (opened on any device)
+
+  1. client_agent.py runs on the client PC, listens on port 7979, and
+     POSTs its IP/hostname to /api/register_client here.
+  2. The browser opens the web UI — the info bar shows the BROWSER'S client IP.
+  3. The UI finds the matching registered agent and shows "Scan This PC".
+  4. Clicking Scan → this server calls POST http://<client-ip>:7979/run.
+  5. The agent scans the client PC, saves PDF+JSON locally, then PUTs them
+     to /api/client_upload/<agent_id>/<type>/<filename> on this server.
+  6. The browser polls /api/client_status/<agent_id> and shows the log.
+  7. When done, Download PDF / Download JSON links appear.
+
+INSTALL (server machine, once)
+-------------------------------
+    pip install flask reportlab
+
+RUN
+---
+    python web_app.py
+
+FILES NEEDED
+------------
+    web_app.py          ← this file (server)
+    client_agent.py     ← copy to each client PC along with app_inventory.py
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import socket
+import types
+import threading
+import importlib.util
+from datetime import datetime
+from pathlib import Path
+
+# ── PIL stub ──────────────────────────────────────────────────────────────────
+_pil_stub = types.ModuleType("PIL")
+_pil_stub.Image = None
+sys.modules.setdefault("PIL", _pil_stub)
+sys.modules.setdefault("PIL.Image", types.ModuleType("PIL.Image"))
+
+from flask import Flask, render_template_string, jsonify, send_file, request, abort
+
+# ── Config ────────────────────────────────────────────────────────────────────
+PORT          = 5051
+AGENT_PORT    = 7979           # port client_agent.py listens on
+OUTPUT_DIR    = Path.home() / "itc_scanner_reports"
+SECRET_TOKEN  = "ITC2024CLIENT"   # must match client_agent.py
+AGENT_TIMEOUT = 90             # seconds to keep an agent in the "online" list
+# ─────────────────────────────────────────────────────────────────────────────
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+app = Flask(__name__)
+
+
+# =============================================================================
+# Registered client agents
+# =============================================================================
+
+_agents_lock = threading.Lock()
+_agents: dict[str, dict] = {}
+# key = "<ip>_<hostname>",  value = {ip, hostname, port, last_seen, status}
+
+
+def _agent_id(ip: str, hostname: str) -> str:
+    safe = re.sub(r'[^A-Za-z0-9_\-]', '_', hostname)
+    return f"{ip.replace('.','_')}_{safe}"
+
+
+def _prune_agents():
+    """Remove agents that haven't pinged in AGENT_TIMEOUT seconds."""
+    cutoff = time.time() - AGENT_TIMEOUT
+    with _agents_lock:
+        stale = [k for k, v in _agents.items() if v["last_seen"] < cutoff]
+        for k in stale:
+            del _agents[k]
+
+
+# =============================================================================
+# Per-client scan state (PDF + JSON stored here after upload)
+# =============================================================================
+
+_client_files_lock = threading.Lock()
+_client_files: dict[str, dict] = {}
+# key = agent_id, value = {"pdf": path, "json": path}
+
+
+# =============================================================================
+# Helper: call the client agent's HTTP API
+# =============================================================================
+
+def _call_agent(agent_id: str, method: str, path: str, body=None) -> dict:
+    import urllib.request, urllib.error
+    with _agents_lock:
+        agent = _agents.get(agent_id)
+    if not agent:
+        return {"error": f"Agent '{agent_id}' not registered or timed out."}
+    url = f"http://{agent['ip']}:{agent['port']}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"X-Token": SECRET_TOKEN, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# =============================================================================
+# HTML Template
+# =============================================================================
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ITC System Scanner</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0F1221; color: #E2E8F0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    background: #1A1F36; border-bottom: 2px solid #4F6EF7;
+    padding: 18px 32px; display: flex; align-items: center;
+    justify-content: space-between; gap: 16px;
+  }
+  .hdr-left p     { color:#7B93FF; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; }
+  .hdr-left h1    { font-size:22px; font-weight:700; margin:2px 0; }
+  .hdr-left small { color:#94A3B8; font-size:12px; }
+  .badge { background:#232946; color:#4F6EF7; font-size:11px; font-weight:700; padding:4px 12px; border-radius:20px; }
+
+  .info-bar {
+    background:#232946; border-bottom:1px solid #2D3561;
+    padding:10px 32px; display:flex; flex-wrap:wrap; gap:32px; align-items:center;
+  }
+  .info-item label { display:block; font-size:10px; color:#94A3B8; text-transform:uppercase; letter-spacing:.05em; }
+  .info-item span  { font-size:13px; font-weight:600; }
+
+  .client-banner {
+    background: #1A2E1A; border: 1px solid #22C55E; border-radius:8px;
+    padding: 10px 18px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    font-size:13px;
+  }
+  .client-banner.not-registered {
+    background: #2E1A1A; border-color: #EF4444;
+  }
+  .client-banner strong { font-weight:700; }
+
+  main { flex:1; max-width:1100px; width:100%; margin:28px auto; padding:0 24px; display:flex; flex-direction:column; gap:20px; }
+
+  .card { background:#1A1F36; border:1px solid #2D3561; border-radius:10px; overflow:hidden; }
+  .card-header { padding:14px 20px; background:#232946; border-bottom:1px solid #2D3561; font-weight:700; font-size:14px; display:flex; align-items:center; gap:8px; }
+
+  .btn { display:inline-flex; align-items:center; gap:8px; padding:11px 24px; border-radius:8px; border:none; font-size:14px; font-weight:600; cursor:pointer; transition:filter .15s,opacity .15s; text-decoration:none; }
+  .btn:hover:not(:disabled) { filter:brightness(1.15); }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .btn-primary   { background:#4F6EF7; color:#fff; }
+  .btn-success   { background:#22C55E; color:#fff; }
+  .btn-secondary { background:#2D3561; color:#E2E8F0; }
+  .btn-small     { padding:6px 14px; font-size:12px; }
+
+  .action-row { display:flex; align-items:center; gap:12px; padding:18px 20px; flex-wrap:wrap; }
+
+  .progress-wrap  { padding:0 20px 16px; }
+  .progress-label { font-size:12px; color:#94A3B8; margin-bottom:6px; }
+  progress { width:100%; height:8px; border-radius:4px; border:none; appearance:none; -webkit-appearance:none; }
+  progress::-webkit-progress-bar   { background:#0B0F1A; border-radius:4px; }
+  progress::-webkit-progress-value { background:#4F6EF7; border-radius:4px; }
+
+  #log {
+    background:#0B0F1A; font-family:'Consolas','Courier New',monospace;
+    font-size:12px; line-height:1.65; padding:16px 20px;
+    height:380px; overflow-y:auto; white-space:pre-wrap; color:#94A3B8;
+  }
+  .log-ok   { color:#22C55E; }
+  .log-warn { color:#F59E0B; }
+  .log-err  { color:#EF4444; }
+  .log-head { color:#7B93FF; font-weight:bold; }
+
+  #result-banner {
+    display: none; padding:16px 20px; border-top:1px solid #2D3561;
+    align-items:center; flex-wrap:wrap; gap:12px;
+  }
+  #result-banner.visible { display: flex; }
+  .result-text { font-size:13px; color:#22C55E; font-weight:600; flex:1; }
+
+  /* Registered clients list */
+  .client-list { padding:16px 20px; display:flex; flex-direction:column; gap:8px; }
+  .client-row  {
+    background:#232946; border:1px solid #2D3561; border-radius:8px;
+    padding:10px 16px; display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  }
+  .client-row .dot { width:9px; height:9px; border-radius:50%; background:#22C55E; flex-shrink:0; }
+  .client-row .info { flex:1; }
+  .client-row .info strong { font-size:13px; }
+  .client-row .info small  { color:#94A3B8; font-size:11px; display:block; }
+  .client-row .actions     { display:flex; gap:8px; }
+
+  footer { text-align:center; padding:14px; color:#2D3561; font-size:11px; border-top:1px solid #1A1F36; }
+
+  #status-dot { width:10px; height:10px; border-radius:50%; background:#2D3561; display:inline-block; transition:background .3s; }
+  #status-dot.scanning { background:#4F6EF7; animation:pulse 1s infinite; }
+  #status-dot.done     { background:#22C55E; animation:none; }
+  #status-dot.error    { background:#EF4444; animation:none; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  .setup-hint {
+    background:#1A1F36; border:1px solid #2D3561; border-radius:10px;
+    padding:20px 24px; font-size:13px; color:#94A3B8; line-height:1.8;
+  }
+  .setup-hint code { background:#0B0F1A; padding:2px 7px; border-radius:4px; font-family:monospace; color:#7B93FF; }
+  .setup-hint h3   { color:#E2E8F0; margin-bottom:10px; font-size:15px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hdr-left">
+    <p>Information Technology Centre</p>
+    <h1>System Scanning &amp; Inventory Tool</h1>
+    <small>Central Railway &nbsp;&bull;&nbsp; Client-Scan Edition v3.0</small>
+  </div>
+  <span class="badge">v3.0</span>
+</header>
+
+<div class="info-bar">
+  <div class="info-item"><label>Your Browser IP</label><span id="ib-client-ip">detecting…</span></div>
+  <div class="info-item"><label>Server Host</label><span id="ib-host">…</span></div>
+  <div class="info-item"><label>Server IP</label><span id="ib-ip">…</span></div>
+  <div class="info-item"><label>Server OS</label><span id="ib-os">…</span></div>
+  <div class="info-item"><label>Server Time</label><span id="ib-time">…</span></div>
+</div>
+
+<main>
+
+  <!-- Client detection banner -->
+  <div id="client-banner-wrap"></div>
+
+  <!-- Registered clients list -->
+  <div class="card">
+    <div class="card-header">🖥️ Registered Client PCs
+      <button class="btn btn-secondary btn-small" style="margin-left:auto" onclick="loadClients()">↻ Refresh</button>
+    </div>
+    <div class="client-list" id="client-list">
+      <span style="color:#94A3B8;font-size:13px;padding:8px 0">Loading client list…</span>
+    </div>
+  </div>
+
+  <!-- Scan controls -->
+  <div class="card" id="scan-card" style="display:none">
+    <div class="card-header"><span id="status-dot"></span> Scan Controls — <span id="scan-target-label" style="color:#7B93FF">no target</span></div>
+    <div class="action-row">
+      <button class="btn btn-primary" id="scan-btn" onclick="startScan()" disabled>▶&nbsp; Scan This PC</button>
+      <span id="status-msg" style="color:#94A3B8;font-size:13px;">Select a client above to begin.</span>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-label" id="prog-label">Waiting…</div>
+      <progress id="prog-bar" value="0" max="100"></progress>
+    </div>
+  </div>
+
+  <!-- Log panel -->
+  <div class="card" id="log-card" style="display:none">
+    <div class="card-header">📋 Live Scan Log</div>
+    <div id="log">Select a client PC above and click Scan to begin…</div>
+    <div id="result-banner">
+      <span class="result-text" id="result-text"></span>
+      <a class="btn btn-success"   id="dl-pdf"  href="#" style="display:none" target="_blank">⬇&nbsp; Download PDF</a>
+      <a class="btn btn-secondary" id="dl-json" href="#" style="display:none" target="_blank">⬇&nbsp; Download JSON</a>
+    </div>
+  </div>
+
+  <!-- Setup hint shown when no clients registered -->
+  <div id="setup-hint" style="display:none" class="setup-hint">
+    <h3>⚙️ How to register a client PC for scanning</h3>
+    <p>No client PCs are registered yet.  To scan a PC:</p>
+    <ol style="margin:10px 0 0 20px">
+      <li>Copy <code>client_agent.py</code> and <code>app_inventory.py</code> to the target PC.</li>
+      <li>Edit <code>SERVER_URL</code> in <code>client_agent.py</code> to point here.</li>
+      <li>On the target PC run:  <code>pip install reportlab</code>  then  <code>python client_agent.py</code></li>
+      <li>Refresh this page — the PC will appear in the list above.</li>
+    </ol>
+  </div>
+
+</main>
+
+<footer>ITC System Scanner &nbsp;&bull;&nbsp; Client-Scan Edition v3.0 &nbsp;&bull;&nbsp; Central Railway</footer>
+
+<script>
+// ── Server info bar ───────────────────────────────────────────────────────────
+async function loadServerInfo() {
+  try {
+    const d = await fetch('/api/info').then(r => r.json());
+    document.getElementById('ib-host').textContent = d.hostname;
+    document.getElementById('ib-ip').textContent   = d.ip;
+    document.getElementById('ib-os').textContent   = d.os;
+  } catch(e) {}
+}
+loadServerInfo();
+setInterval(() => {
+  document.getElementById('ib-time').textContent = new Date().toLocaleTimeString();
+}, 1000);
+document.getElementById('ib-time').textContent = new Date().toLocaleTimeString();
+
+// ── Detect browser's IP via the server ───────────────────────────────────────
+let myClientIp = null;
+async function detectClientIp() {
+  try {
+    const d = await fetch('/api/my_ip').then(r => r.json());
+    myClientIp = d.ip;
+    document.getElementById('ib-client-ip').textContent = d.ip;
+    updateClientBanner();
+  } catch(e) {
+    document.getElementById('ib-client-ip').textContent = 'unknown';
+  }
+}
+detectClientIp();
+
+// ── Client banner ─────────────────────────────────────────────────────────────
+let registeredClients = [];
+let selectedAgentId   = null;
+
+function updateClientBanner() {
+  const wrap = document.getElementById('client-banner-wrap');
+  if (!myClientIp) { wrap.innerHTML = ''; return; }
+
+  const match = registeredClients.find(c => c.ip === myClientIp);
+  if (match) {
+    wrap.innerHTML = `
+      <div class="client-banner">
+        <span style="color:#22C55E;font-size:18px">✓</span>
+        <span>Your PC (<strong>${myClientIp} — ${match.hostname}</strong>) has the agent running and is ready to scan.</span>
+        <button class="btn btn-primary btn-small" onclick="selectClient('${match.agent_id}','${match.ip}','${match.hostname}')">Select This PC</button>
+      </div>`;
+  } else {
+    wrap.innerHTML = `
+      <div class="client-banner not-registered">
+        <span style="color:#EF4444;font-size:18px">✗</span>
+        <span>Your PC (<strong>${myClientIp}</strong>) does not have the client agent running.
+        Run <code style="background:#1A1F36;padding:2px 6px;border-radius:4px;font-family:monospace">python client_agent.py</code>
+        on this machine to enable scanning.</span>
+      </div>`;
+  }
+}
+
+async function loadClients() {
+  try {
+    const d = await fetch('/api/clients').then(r => r.json());
+    registeredClients = d.clients || [];
+    renderClientList(registeredClients);
+    updateClientBanner();
+  } catch(e) {}
+}
+loadClients();
+setInterval(loadClients, 15051);   // refresh every 15 s
+
+function renderClientList(clients) {
+  const el = document.getElementById('client-list');
+  const hint = document.getElementById('setup-hint');
+  if (!clients.length) {
+    el.innerHTML = '<span style="color:#94A3B8;font-size:13px;padding:8px 0">No client PCs registered yet.</span>';
+    hint.style.display = '';
+    return;
+  }
+  hint.style.display = 'none';
+  el.innerHTML = clients.map(c => `
+    <div class="client-row">
+      <span class="dot"></span>
+      <div class="info">
+        <strong>${c.hostname}</strong>
+        <small>${c.ip}  &bull;  port ${c.port}  &bull;  last seen ${c.last_seen_ago}s ago</small>
+      </div>
+      <div class="actions">
+        <button class="btn btn-primary btn-small"
+          onclick="selectClient('${c.agent_id}','${c.ip}','${c.hostname}')">
+          ▶ Scan This PC
+        </button>
+      </div>
+    </div>`).join('');
+}
+
+function selectClient(agentId, ip, hostname) {
+  selectedAgentId = agentId;
+  document.getElementById('scan-target-label').textContent = `${hostname}  (${ip})`;
+  document.getElementById('scan-btn').disabled = false;
+  document.getElementById('scan-card').style.display = '';
+  document.getElementById('log-card').style.display  = '';
+  document.getElementById('status-msg').textContent  = `Ready to scan ${hostname} (${ip}).  Click Scan.`;
+  document.getElementById('log').textContent = `Target selected: ${hostname} (${ip})\nClick "Scan This PC" to begin.\n`;
+  // reset result banner
+  document.getElementById('result-banner').classList.remove('visible');
+  document.getElementById('dl-pdf').style.display  = 'none';
+  document.getElementById('dl-json').style.display = 'none';
+  document.getElementById('prog-bar').value = 0;
+  document.getElementById('prog-label').textContent = 'Waiting…';
+  setDot('');
+}
+
+// ── Scan ──────────────────────────────────────────────────────────────────────
+let pollTimer    = null;
+let fakeTimer    = null;
+let logOffset    = 0;
+let fakeProgress = 0;
+
+function setDot(state) { document.getElementById('status-dot').className = state; }
+
+async function startScan() {
+  if (!selectedAgentId) { alert('Please select a client PC first.'); return; }
+
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Scanning…';
+
+  document.getElementById('log').textContent = '';
+  document.getElementById('result-banner').classList.remove('visible');
+  document.getElementById('dl-pdf').style.display  = 'none';
+  document.getElementById('dl-json').style.display = 'none';
+  document.getElementById('status-msg').textContent = 'Scan running on client PC…';
+  document.getElementById('prog-label').textContent = 'Scanning…';
+  document.getElementById('prog-bar').value = 2;
+  logOffset = 0; fakeProgress = 2;
+  setDot('scanning');
+
+  clearInterval(fakeTimer);
+  fakeTimer = setInterval(() => {
+    if (fakeProgress < 92) { fakeProgress += 0.3; document.getElementById('prog-bar').value = fakeProgress; }
+  }, 350);
+
+  try {
+    const d = await fetch(`/api/scan_client/${selectedAgentId}`, { method: 'POST' }).then(r => r.json());
+    if (d.error) { onScanError(d.error); return; }
+    clearInterval(pollTimer);
+    pollTimer = setInterval(pollClientLog, 1200);
+  } catch(e) { onScanError(String(e)); }
+}
+
+function appendLog(lines) {
+  const el = document.getElementById('log');
+  lines.forEach(line => {
+    const span = document.createElement('span');
+    if      (/\[ERROR\]|Scan failed/i.test(line)) span.className = 'log-err';
+    else if (/Done\.|complete|PDF saved|JSON saved|Uploaded/i.test(line)) span.className = 'log-ok';
+    else if (/={5,}/.test(line)) span.className = 'log-head';
+    else if (/WARNING|warn/i.test(line)) span.className = 'log-warn';
+    span.textContent = line + '\n';
+    el.appendChild(span);
+  });
+  el.scrollTop = el.scrollHeight;
+}
+
+function pollClientLog() {
+  fetch(`/api/client_status/${selectedAgentId}?offset=${logOffset}`)
+    .then(r => r.json())
+    .then(d => {
+      if (d.lines && d.lines.length) {
+        appendLog(d.lines);
+        logOffset += d.lines.length;
+      }
+      if (d.status === 'done' || d.status === 'error') {
+        clearInterval(pollTimer);
+        clearInterval(fakeTimer);
+        setTimeout(() => fetchClientResult(selectedAgentId), 800);
+      }
+    })
+    .catch(() => {});
+}
+
+async function fetchClientResult(agentId) {
+  try {
+    const d = await fetch(`/api/client_result/${agentId}`).then(r => r.json());
+    onScanDone(d, agentId);
+  } catch(e) { onScanError(String(e)); }
+}
+
+function onScanDone(d, agentId) {
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = false;
+  btn.textContent = '▶ Scan This PC';
+  document.getElementById('prog-bar').value = 100;
+
+  if (d.error) { onScanError(d.error); return; }
+  if (!d.pdf_name) { onScanError('Scan did not produce a report.'); return; }
+
+  setDot('done');
+  document.getElementById('prog-label').textContent = '✓ Scan complete';
+  document.getElementById('status-msg').textContent = 'Scan complete — download your report below.';
+  document.getElementById('result-text').textContent = `✓  Report ready: ${d.pdf_name}`;
+
+  document.getElementById('dl-pdf').href  = `/api/client_download/${agentId}/pdf`;
+  document.getElementById('dl-json').href = `/api/client_download/${agentId}/json`;
+  document.getElementById('dl-pdf').style.display  = '';
+  document.getElementById('dl-json').style.display = '';
+  document.getElementById('result-banner').classList.add('visible');
+}
+
+function onScanError(msg) {
+  clearInterval(fakeTimer); clearInterval(pollTimer);
+  document.getElementById('prog-bar').value = 0;
+  document.getElementById('prog-label').textContent = 'Scan failed — see log above';
+  document.getElementById('status-msg').textContent = 'Error: ' + msg;
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = false;
+  btn.textContent = '▶ Scan This PC';
+  setDot('error');
+}
+</script>
+</body>
+</html>
+"""
+
+
+# =============================================================================
+# Routes
+# =============================================================================
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+
+@app.route("/api/info")
+def api_info():
+    import platform
+    return jsonify({
+        "hostname": socket.gethostname(),
+        "ip":       _get_local_ip(),
+        "os":       f"{platform.system()} {platform.release()}",
+        "arch":     platform.machine(),
+    })
+
+
+@app.route("/api/my_ip")
+def api_my_ip():
+    """Return the IP address of whoever is calling this endpoint (the browser's PC)."""
+    # X-Forwarded-For is set by proxies; for direct LAN use, REMOTE_ADDR is correct
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if ip and "," in ip:
+        ip = ip.split(",")[0].strip()
+    return jsonify({"ip": ip})
+
+
+# ── Client registration ───────────────────────────────────────────────────────
+
+@app.route("/api/register_client", methods=["POST"])
+def api_register_client():
+    token = request.headers.get("X-Token", "")
+    if token != SECRET_TOKEN:
+        abort(401)
+    data = request.get_json(force=True, silent=True) or {}
+    ip       = data.get("ip", request.remote_addr)
+    hostname = data.get("hostname", "unknown")
+    port     = int(data.get("port", AGENT_PORT))
+    aid      = _agent_id(ip, hostname)
+    with _agents_lock:
+        _agents[aid] = {
+            "agent_id":  aid,
+            "ip":        ip,
+            "hostname":  hostname,
+            "port":      port,
+            "last_seen": time.time(),
+            "status":    "idle",
+        }
+    return jsonify({"registered": True, "agent_id": aid})
+
+
+@app.route("/api/clients")
+def api_clients():
+    _prune_agents()
+    now = time.time()
+    with _agents_lock:
+        clients = [
+            {**v, "last_seen_ago": int(now - v["last_seen"])}
+            for v in _agents.values()
+        ]
+    return jsonify({"clients": clients})
+
+
+# ── Trigger scan on a client ──────────────────────────────────────────────────
+
+@app.route("/api/scan_client/<agent_id>", methods=["POST"])
+def api_scan_client(agent_id: str):
+    result = _call_agent(agent_id, "POST", "/run")
+    if "error" in result:
+        return jsonify(result), 500
+    # Reset any previously stored files for this agent
+    with _client_files_lock:
+        _client_files.pop(agent_id, None)
+    return jsonify(result)
+
+
+# ── Poll the client's scan log ────────────────────────────────────────────────
+
+@app.route("/api/client_status/<agent_id>")
+def api_client_status(agent_id: str):
+    offset = int(request.args.get("offset", 0))
+    result = _call_agent(agent_id, "GET", "/status")
+    if "error" in result:
+        return jsonify({"status": "error", "lines": [result["error"]], "error": result["error"]})
+    lines = result.get("log", [])[offset:]
+    return jsonify({
+        "status": result.get("status", "unknown"),
+        "lines":  lines,
+        "error":  result.get("error", ""),
+    })
+
+
+# ── Receive uploaded PDF / JSON from the client agent ────────────────────────
+
+@app.route("/api/client_upload/<agent_id>/<ftype>/<filename>", methods=["PUT"])
+def api_client_upload(agent_id: str, ftype: str, filename: str):
+    token = request.headers.get("X-Token", "")
+    if token != SECRET_TOKEN:
+        abort(401)
+
+    # Sanitise filename
+    filename = re.sub(r'[^A-Za-z0-9_\-.]', '_', os.path.basename(filename))
+    save_path = OUTPUT_DIR / filename
+
+    data = request.get_data()
+    with open(save_path, "wb") as f:
+        f.write(data)
+
+    with _client_files_lock:
+        if agent_id not in _client_files:
+            _client_files[agent_id] = {}
+        _client_files[agent_id][ftype] = str(save_path)
+
+    return jsonify({"status": "ok", "bytes": len(data), "path": str(save_path)})
+
+
+# ── Get scan result metadata ──────────────────────────────────────────────────
+
+@app.route("/api/client_result/<agent_id>")
+def api_client_result(agent_id: str):
+    with _client_files_lock:
+        files = _client_files.get(agent_id, {})
+
+    if not files:
+        # Files not uploaded yet — also check agent status
+        status = _call_agent(agent_id, "GET", "/status")
+        if status.get("status") == "error":
+            return jsonify({"error": status.get("error", "Scan failed.")})
+        return jsonify({"pending": True})
+
+    pdf_path  = files.get("pdf", "")
+    json_path = files.get("json", "")
+
+    return jsonify({
+        "pdf_name":  os.path.basename(pdf_path)  if pdf_path  else "",
+        "json_name": os.path.basename(json_path) if json_path else "",
+        "ok": True,
+    })
+
+
+# ── Download the result files ─────────────────────────────────────────────────
+
+@app.route("/api/client_download/<agent_id>/pdf")
+def download_client_pdf(agent_id: str):
+    with _client_files_lock:
+        path = _client_files.get(agent_id, {}).get("pdf")
+    if not path or not os.path.isfile(path):
+        return "No PDF available for this client yet.", 404
+    return send_file(path, as_attachment=True,
+                     download_name=os.path.basename(path),
+                     mimetype="application/pdf")
+
+
+@app.route("/api/client_download/<agent_id>/json")
+def download_client_json(agent_id: str):
+    with _client_files_lock:
+        path = _client_files.get(agent_id, {}).get("json")
+    if not path or not os.path.isfile(path):
+        return "No JSON available for this client yet.", 404
+    return send_file(path, as_attachment=True,
+                     download_name=os.path.basename(path),
+                     mimetype="application/json")
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main():
+    local_ip = _get_local_ip()
+    print("=" * 60)
+    print("  ITC System Scanner  —  Client-Scan Web Server  v3.0")
+    print("=" * 60)
+    print(f"  Local URL  :  http://127.0.0.1:{PORT}")
+    print(f"  LAN URL    :  http://{local_ip}:{PORT}")
+    print(f"  Reports    :  {OUTPUT_DIR}")
+    print()
+    print("  On each PC you want to scan, run:")
+    print("      python client_agent.py")
+    print()
+    print("  Then open the LAN URL in a browser on any device.")
+    print("  Press Ctrl+C to stop the server.")
+    print("=" * 60)
+
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()
