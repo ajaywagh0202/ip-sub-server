@@ -450,7 +450,7 @@ def _upload_results(pdf_path, json_path, client_ip, client_name, form_data, log_
             )
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = _decode_upload_response(resp.read())
-                log_fn(f"  Uploaded PDF+JSON -> register API via server: {result}")
+                log_fn(f"  Uploaded PDF+JSON -> device-scan API via server: {result}")
             return
 
         except urllib.error.HTTPError as exc:

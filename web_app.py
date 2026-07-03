@@ -62,7 +62,10 @@ AGENT_PORT    = 7979           # port client_agent.py listens on
 OUTPUT_DIR    = Path.home() / "itc_scanner_reports"
 SECRET_TOKEN  = "ITC2024CLIENT"   # must match client_agent.py
 AGENT_TIMEOUT = 600            # seconds — long scans can take several minutes
-REGISTER_API_URL = os.environ.get("REGISTER_API_URL", "http://10.31.3.114:5000/api/register")
+DEVICE_SCAN_API_URL = os.environ.get(
+    "DEVICE_SCAN_API_URL",
+    os.environ.get("REGISTER_API_URL", "http://10.31.3.114:5000/api/device-scan"),
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -407,7 +410,6 @@ HTML = r"""<!DOCTYPE html>
     <div class="card-header"><span id="status-dot"></span> Scan Controls — <span id="scan-target-label" style="color:#7B93FF">Please select a client PC</span></div>
     <div class="action-row">
       <button class="btn btn-primary" id="scan-btn" onclick="startScan()" disabled>▶&nbsp; Scan This PC</button>
-      <button class="btn btn-secondary" id="registration-btn" onclick="openRegistration()">Registration</button>
       
       <!-- Persistent View PDF Button - beautifully rendered and visible on page load -->
       <button class="btn btn-success" id="view-pdf-btn" onclick="openPdfViewer()" disabled style="opacity: 0.5; cursor: not-allowed;">👁&nbsp; View PDF</button>
@@ -1863,41 +1865,48 @@ def _client_upload_safe_filename(filename: str, fallback: str) -> str:
     return name or fallback
 
 
-def _client_upload_normalize_fields(fields: dict) -> dict:
-    serial_value = (
-        fields.get("serial_no")
-        or fields.get("Serial_no")
-        or fields.get("serial_number")
-        or ""
-    ).strip()
-    if serial_value:
-        fields.setdefault("serial_no", serial_value)
-        fields.setdefault("Serial_no", serial_value)
-        fields.setdefault("serial_number", serial_value)
+def _client_upload_device_scan_fields(values: dict):
+    """Return only the multipart fields accepted by POST /api/device-scan."""
+    source = {str(key): _client_upload_value(value) for key, value in values.items()}
+    aliases = {
+        "dsr_no": ("dsr_no", "DSR_no"),
+        "serial_no": ("serial_no", "Serial_no", "serial_number"),
+        "pf_no": ("pf_no", "PF_no"),
+        "target_ip": ("target_ip", "ip"),
+        "name": ("name", "employee_name", "client_name"),
+        "phone": ("phone", "phone_no", "mobile"),
+    }
 
-    dept_name = fields.get("dept_name", "").strip()
-    if dept_name and not fields.get("department"):
-        fields["department"] = dept_name
-
-    return fields
-
-
-def _client_upload_fields_from_data(form_data: dict) -> dict:
     fields = {}
-    for key, value in form_data.items():
-        fields[str(key)] = _client_upload_value(value)
-    return _client_upload_normalize_fields(fields)
+    for destination, candidates in aliases.items():
+        value = next((source.get(key, "") for key in candidates if source.get(key, "")), "")
+        if value:
+            fields[destination] = value
+
+    missing = [name for name in ("dsr_no", "serial_no", "pf_no", "target_ip") if not fields.get(name)]
+    return fields, missing
 
 
-def _client_upload_register_fields(form_data: dict) -> dict:
-    fields = {}
-    for key in request.form:
-        if key == "data":
-            continue
-        fields[str(key)] = _client_upload_value(request.form.get(key))
-    for key, value in form_data.items():
-        fields[str(key)] = _client_upload_value(value)
-    return _client_upload_normalize_fields(fields)
+def _client_upload_fields_from_data(form_data: dict):
+    return _client_upload_device_scan_fields(form_data)
+
+
+def _client_upload_request_fields(form_data: dict):
+    fields = {
+        str(key): _client_upload_value(request.form.get(key))
+        for key in request.form
+        if key != "data"
+    }
+    fields.update({str(key): _client_upload_value(value) for key, value in form_data.items()})
+    return _client_upload_device_scan_fields(fields)
+
+
+def _client_upload_validate_json(content: bytes):
+    try:
+        json.loads(content)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return f"json_file must contain valid JSON: {exc}"
+    return None
 
 
 def _client_upload_build_multipart(fields: dict, files: list):
@@ -1944,15 +1953,19 @@ def _client_upload_decode_response(content_type: str, data: bytes):
         return {"raw": text}
 
 
-def _client_upload_forward_to_register(fields: dict, files: list):
+def _client_upload_forward_to_device_scan(fields: dict, files: list):
+    import http.client
     import urllib.error
     import urllib.request
 
     body, boundary = _client_upload_build_multipart(fields, files)
     file_names = [filename for _, filename, _, _ in files]
-    print(f"Forwarding to REGISTER_API_URL: fields={sorted(fields.keys())}, files={file_names}")
+    print(f"Forwarding to DEVICE_SCAN_API_URL: fields={sorted(fields.keys())}, files={file_names}")
     req = urllib.request.Request(
-        REGISTER_API_URL,
+        DEVICE_SCAN_API_URL,
+        # urllib must receive the encoded multipart bytes.  Supplying a dict
+        # makes it start a POST but fail while streaming the body, which
+        # aborts the peer's Multer request.
         data=body,
         method="POST",
         headers={
@@ -1967,18 +1980,20 @@ def _client_upload_forward_to_register(fields: dict, files: list):
                 resp.headers.get("Content-Type", ""),
                 resp.read(),
             )
-            print(f"REGISTER_API_URL response {resp.getcode()}: {payload}")
+            print(f"DEVICE_SCAN_API_URL response {resp.getcode()}: {payload}")
             return resp.getcode(), payload, None
     except urllib.error.HTTPError as exc:
         payload = _client_upload_decode_response(
             exc.headers.get("Content-Type", ""),
             exc.read(),
         )
-        print(f"REGISTER_API_URL rejected upload {exc.code}: {payload}")
-        return exc.code, payload, "Register service rejected upload"
-    except urllib.error.URLError as exc:
-        print(f"REGISTER_API_URL unavailable: {exc}")
-        return 502, {"detail": str(exc)}, "Register service unavailable"
+        print(f"DEVICE_SCAN_API_URL rejected upload {exc.code}: {payload}")
+        return exc.code, payload, "Device-scan service rejected upload"
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # A Node/Multer server can reset the socket while parsing a multipart
+        # body.  It is an upstream failure, not an unhandled Flask error.
+        print(f"DEVICE_SCAN_API_URL connection failed: {exc}")
+        return 502, {"detail": str(exc)}, "Device-scan service connection failed"
 
 
 def _client_upload_fetch_agent_file(agent_id: str, ftype: str, target_name: str = ""):
@@ -2063,17 +2078,28 @@ def _client_upload_forward_saved_files(agent_id: str):
     if not pdf_bytes or not json_bytes:
         return None
 
+    json_error = _client_upload_validate_json(json_bytes)
+    if json_error:
+        return {"error": json_error}
+
+    form_data.setdefault("target_ip", "")
+    if not form_data["target_ip"]:
+        with _agents_lock:
+            form_data["target_ip"] = _agents.get(agent_id, {}).get("ip", "")
+    fields, missing = _client_upload_fields_from_data(form_data)
+    if missing:
+        return {"error": f"Device-scan requires: {', '.join(missing)}"}
+
     with _client_form_data_lock:
         if agent_id in _client_register_sent:
             return {"status": "already_sent"}
         _client_register_sent.add(agent_id)
 
-    fields = _client_upload_fields_from_data(form_data)
     files = [
         ("pdf_file", os.path.basename(pdf_path), "application/pdf", pdf_bytes),
         ("json_file", os.path.basename(json_path), "application/json", json_bytes),
     ]
-    status_code, payload, error = _client_upload_forward_to_register(fields, files)
+    status_code, payload, error = _client_upload_forward_to_device_scan(fields, files)
     result = {"target_status": status_code, "data": payload}
     if error:
         with _client_form_data_lock:
@@ -2085,7 +2111,7 @@ def _client_upload_forward_saved_files(agent_id: str):
 
 
 @app.route("/api/client_upload", methods=["POST"])
-def api_client_upload_register():
+def api_client_upload_device_scan():
     raw = request.args.get("data")
     try:
         form_data = json.loads(raw) if raw else {}
@@ -2111,6 +2137,16 @@ def api_client_upload_register():
     json_bytes = json_upload.read()
     if not pdf_bytes or not json_bytes:
         return jsonify({"error": "Uploaded PDF and JSON files must not be empty"}), 400
+    json_error = _client_upload_validate_json(json_bytes)
+    if json_error:
+        return jsonify({"error": json_error}), 400
+
+    request_data = dict(form_data)
+    if not request_data.get("target_ip"):
+        request_data["target_ip"] = request.headers.get("X-Client-IP", "").strip()
+    fields, missing = _client_upload_request_fields(request_data)
+    if missing:
+        return jsonify({"error": f"Device-scan requires: {', '.join(missing)}"}), 400
 
     _clear_output_dir()
     pdf_path = OUTPUT_DIR / pdf_name
@@ -2133,16 +2169,15 @@ def api_client_upload_register():
         with _client_form_data_lock:
             _client_form_data[agent_id] = dict(form_data)
 
-    fields = _client_upload_register_fields(form_data)
     files = [
         ("pdf_file", pdf_path.name, "application/pdf", pdf_bytes),
         ("json_file", json_path.name, "application/json", json_bytes),
     ]
 
-    status_code, register_payload, error = _client_upload_forward_to_register(fields, files)
+    status_code, device_scan_payload, error = _client_upload_forward_to_device_scan(fields, files)
     response = {
         "target_status": status_code,
-        "data": register_payload,
+        "data": device_scan_payload,
     }
     if error:
         response["error"] = error

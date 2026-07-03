@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set SERVER=http://10.31.3.114/:5051
+set SERVER=http://10.31.3.114:5051
 echo.
 echo ============================================
 echo   ITC System Scanner - Windows Auto-Install
