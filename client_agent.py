@@ -11,7 +11,7 @@ HOW IT WORKS
   1. You run  python client_agent.py  on the client PC.
   2. The agent auto-detects its own LAN IP and registers with the server
      at SERVER_URL (edit the line below to match your server's address).
-  3. You open the web interface (http://<server-ip>:5051) in a browser.
+  3. You open the web interface (http://<server-ip>:5001) in a browser.
   4. The web page now lists this client PC.  Click "Scan This PC".
   5. The server tells the agent to run app_inventory.py locally.
   6. The agent runs the scan, saves PDF + JSON, then uploads them to the server.
@@ -44,12 +44,12 @@ import importlib.util
 import traceback
 import uuid
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-SERVER_URL    = "http://192.168.1.10:5051"   # <- CHANGE to your web_app.py server
+SERVER_URL    = "http://10.31.3.114:5001"   # <- CHANGE to your web_app.py server
 AGENT_PORT    = 7979                          # port this agent listens on
 OUTPUT_DIR    = Path.home() / "itc_scanner_reports"
 SECRET_TOKEN  = "ITC2024CLIENT"              # must match web_app.py
@@ -470,6 +470,25 @@ def _upload_results(pdf_path, json_path, client_ip, client_name, form_data, log_
 
 class ClientAgentHandler(BaseHTTPRequestHandler):
 
+    def end_headers(self):
+        # Browser access is limited to the public health endpoints.
+        origin = self.headers.get("Origin")
+        if (urlparse(self.path).path in ("/health", "/ping")
+                and origin in ("http://10.31.3.114:3000", "http://localhost:3000")):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Vary", "Origin")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        if urlparse(self.path).path not in ("/health", "/ping"):
+            self._send_json({"error": "not found"}, 404)
+            return
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def log_message(self, fmt, *args):
         print(f"[agent-http] {self.address_string()}  {fmt % args}")
 
@@ -491,12 +510,13 @@ class ClientAgentHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
 
-        if path == "/ping":
+        if path in ("/ping", "/health"):
             self._send_json({
                 "alive":  True,
                 "host":   socket.gethostname(),
                 "ip":     get_local_ip(),
-                "status": _state["status"],
+                "status": "ok" if path == "/health" else _state["status"],
+                "scan_status": _state["status"],
             })
             return
 
@@ -672,7 +692,7 @@ def main():
     t.start()
 
     # Start the local HTTP listener
-    server = HTTPServer(("0.0.0.0", AGENT_PORT), ClientAgentHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", AGENT_PORT), ClientAgentHandler)
     print(f"\n  Agent listening on port {AGENT_PORT}.  Press Ctrl+C to stop.")
     print(f"  Open {SERVER_URL} in any browser to scan this PC.\n")
 

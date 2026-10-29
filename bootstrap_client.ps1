@@ -4,14 +4,14 @@
 # =====================================================================
 # Run this ONE command on any Windows client PC (PowerShell as Admin):
 #
-#   Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('http://<SERVER_IP>:5051/static/bootstrap_client.ps1'))
+#   Set-ExecutionPolicy Bypass -Scope Process -Force; iex ((New-Object System.Net.WebClient).DownloadString('http://<SERVER_IP>:5001/static/bootstrap_client.ps1'))
 #
 # Or if you have the file locally:
 #   powershell -ExecutionPolicy Bypass -File bootstrap_client.ps1
 # =====================================================================
 
 param(
-    [string]$Server = "http://192.168.1.10:5051"   # <-- SET YOUR SERVER IP HERE
+    [string]$Server = "http://10.31.3.114:5001"   # <-- SET YOUR SERVER IP HERE
 )
 
 $ErrorActionPreference = "Stop"

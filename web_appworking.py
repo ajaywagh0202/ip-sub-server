@@ -8,7 +8,7 @@ HOW IT WORKS
 ------------
   Server machine:   python web_app.py            (runs always-on)
   Client PC:        python client_agent.py        (run on each PC to scan)
-  Browser:          http://<server-ip>:5051       (opened on any device)
+  Browser:          http://<server-ip>:5001       (opened on any device)
 
   1. client_agent.py runs on the client PC, listens on port 7979, and
      POSTs its IP/hostname to /api/register_client here.
@@ -57,7 +57,7 @@ sys.modules.setdefault("PIL.Image", types.ModuleType("PIL.Image"))
 from flask import Flask, render_template_string, jsonify, send_file, request, abort
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PORT          = 5051
+PORT          = 5001
 AGENT_PORT    = 7979           # port client_agent.py listens on
 OUTPUT_DIR    = Path.home() / "itc_scanner_reports"
 SECRET_TOKEN  = "ITC2024CLIENT"   # must match client_agent.py
@@ -985,14 +985,14 @@ import re as _re
 _DEPLOY_CLIENT_PY = r'''#!/usr/bin/env python3
 """
 deploy_client.py  -  ITC System Scanner  (Zero-Touch Client Auto-Deployer)
-Run with:  python deploy_client.py --server http://<server-ip>:5051
+Run with:  python deploy_client.py --server http://<server-ip>:5001
 """
 import os, sys, json, time, shutil, socket, argparse, platform
 import subprocess, threading, urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
 
-DEFAULT_SERVER_URL = "http://192.168.1.10:5051"
+DEFAULT_SERVER_URL = "http://10.31.3.114:5001"
 AGENT_PORT   = 7979
 SECRET_TOKEN = "ITC2024CLIENT"
 INSTALL_DIR  = Path.home() / "itc_agent"
@@ -1209,7 +1209,7 @@ if __name__=="__main__": main()
 '''
 
 _BOOTSTRAP_PS1 = r'''# bootstrap_client.ps1 - ITC Zero-Touch Windows Deployer
-param([string]$Server = "http://192.168.1.10:5051")
+param([string]$Server = "http://10.31.3.114:5001")
 $ErrorActionPreference = "Continue"
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
@@ -1295,7 +1295,7 @@ if ($LASTEXITCODE -eq 0) {
 
 _BOOTSTRAP_SH = r'''#!/bin/bash
 # bootstrap_client.sh - ITC Zero-Touch Linux/macOS Deployer
-SERVER="http://192.168.1.10:5051"
+SERVER="http://10.31.3.114:5001"
 while [[ $# -gt 0 ]]; do case $1 in --server) SERVER="$2"; shift 2;; *) shift;; esac; done
 echo ""
 echo "============================================"
@@ -1553,8 +1553,8 @@ def serve_static_deploy_file(filename: str):
 
     if content_str is not None:
         local_ip   = _get_local_ip()
-        server_url = f"http://{local_ip}:{PORT}"
-        content_str = content_str.replace("http://192.168.1.10:5051", server_url)
+        server_url = f"http://10.31.3.114:{PORT}"
+        content_str = content_str.replace("http://10.31.3.114:5001", server_url)
         return app.response_class(
             response=content_str.encode("utf-8"),
             mimetype=mimetype,
@@ -1577,7 +1577,7 @@ def install_os(os_type: str):
     One-click installer — returns a .bat (Windows) or .sh (Linux/macOS) script.
     """
     local_ip   = _get_local_ip()
-    server_url = f"http://{local_ip}:{PORT}"
+    server_url = f"http://10.31.3.114:{PORT}"
 
     if os_type == "windows":
         content = _INSTALL_BAT.replace("__SERVER_URL__", server_url)
@@ -1587,7 +1587,7 @@ def install_os(os_type: str):
             headers={"Content-Disposition": 'attachment; filename="itc_install.bat"'},
         )
     elif os_type in ("linux", "mac", "macos"):
-        content = _BOOTSTRAP_SH.replace("http://192.168.1.10:5051", server_url)
+        content = _BOOTSTRAP_SH.replace("http://10.31.3.114:5001", server_url)
         return app.response_class(
             response=content.encode("utf-8"),
             mimetype="text/x-sh",

@@ -5,18 +5,18 @@
 # =====================================================================
 # Run this ONE command on any Linux/macOS client:
 #
-#   curl -fsSL http://<SERVER_IP>:5051/static/bootstrap_client.sh | bash -s -- --server http://<SERVER_IP>:5051
+#   curl -fsSL http://<SERVER_IP>:5001/static/bootstrap_client.sh | bash -s -- --server http://<SERVER_IP>:5001
 #
 # Or with wget:
-#   wget -qO- http://<SERVER_IP>:5051/static/bootstrap_client.sh | bash -s -- --server http://<SERVER_IP>:5051
+#   wget -qO- http://<SERVER_IP>:5001/static/bootstrap_client.sh | bash -s -- --server http://<SERVER_IP>:5001
 #
 # Or if you have the file locally:
-#   bash bootstrap_client.sh --server http://192.168.1.10:5051
+#   bash bootstrap_client.sh --server http://10.31.3.114:5001
 # =====================================================================
 
 set -e
 
-SERVER="http://192.168.1.10:5051"   # default, overridden by --server flag
+SERVER="http://10.31.3.114:5001"   # default, overridden by --server flag
 
 # Parse args
 while [[ $# -gt 0 ]]; do

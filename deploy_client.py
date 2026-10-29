@@ -14,14 +14,14 @@ Run this ONE script on any client PC.  It does EVERYTHING automatically:
 USAGE — paste and run ONE command on the client PC:
 ----------------------------------------------------
   Windows (PowerShell as Administrator):
-      python deploy_client.py --server http://192.168.1.10:5051
+      python deploy_client.py --server http://10.31.3.114:5001
 
   Linux / macOS:
-      python3 deploy_client.py --server http://192.168.1.10:5051
+      python3 deploy_client.py --server http://10.31.3.114:5001
 
 Or double-click after editing SERVER_URL below.
 
-NO other steps needed.  The page at http://<server>:5051 will show this
+NO other steps needed.  The page at http://<server>:5001 will show this
 PC within ~10 seconds.
 """
 
@@ -41,7 +41,7 @@ from pathlib import Path
 from datetime import datetime
 
 # ── Default config (edit here if not using --server flag) ─────────────────────
-DEFAULT_SERVER_URL = "http://192.168.1.10:5051"   # ← change to your server IP
+DEFAULT_SERVER_URL = "http://10.31.3.114:5001"   # ← change to your server IP
 AGENT_PORT         = 7979
 SECRET_TOKEN       = "ITC2024CLIENT"
 INSTALL_DIR        = Path.home() / "itc_agent"
@@ -140,7 +140,7 @@ def verify_server(server_url: str):
         L.ok(f"Server reachable: {data.get('hostname')} ({data.get('ip')})  OS: {data.get('os')}")
     except Exception as exc:
         L.err(f"Cannot reach server at {server_url}: {exc}")
-        L.err("Make sure web_app.py is running on the server and port 5051 is open.")
+        L.err("Make sure web_app.py is running on the server and port 5001 is open.")
         sys.exit(1)
 
 
