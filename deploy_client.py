@@ -548,6 +548,29 @@ def print_summary(server_url: str, success: bool):
 # Main
 # =============================================================================
 
+def install_windows_launcher():
+    """Register a fixed per-user command, ignoring all URI arguments."""
+    import winreg
+    key_path = r"Software\Classes\itc-agent"
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "URL:ITC Agent")
+        winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+    executable = Path(sys.executable).with_name("pythonw.exe")
+    if not executable.exists():
+        executable = Path(sys.executable)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path + r"\shell\open\command") as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ,
+                         f'"{executable}" "{INSTALL_DIR / "client_agent.py"}"')
+    subprocess.run(["schtasks", "/Delete", "/TN", SERVICE_NAME, "/F"], capture_output=True)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, SERVICE_NAME)
+    except FileNotFoundError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ITC Client Auto-Deployer — zero-touch setup"
@@ -577,7 +600,9 @@ def main():
     install_deps()
     started = start_agent()
 
-    if not args.no_service:
+    if IS_WINDOWS:
+        install_windows_launcher()
+    elif not args.no_service:
         install_startup_service(server_url)
 
     if started:

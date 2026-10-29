@@ -291,21 +291,16 @@ def _run_scan_worker(form_data=None):
         log("  Scan complete.  Files saved locally.")
         log("=" * 64)
 
-        # ── Mark scan as DONE immediately so the browser sees it ─────────────
-        # Upload happens in a background thread — it must NOT block status.
         with _lock:
-            _state["pdf_path"]  = pdf_path
+            _state["pdf_path"] = pdf_path
             _state["json_path"] = json_path
-            _state["status"]    = "done"
-
-        # ── Upload to server in background (non-blocking) ─────────────────────
-        def _do_upload():
-            log("  Uploading to server (background) ...")
-            _upload_results(pdf_path, json_path, target_ip, system_name, form_data, log)
-            log("  Upload complete.")
-
-        upload_thread = threading.Thread(target=_do_upload, daemon=True)
-        upload_thread.start()
+            _state["status"] = "uploading"
+        log("Saving scan to database ...")
+        _upload_results(pdf_path, json_path, target_ip, system_name, form_data, log)
+        with _lock:
+            _state["status"] = "done"
+        log("Database save acknowledged. Stopping agent.")
+        threading.Thread(target=_shutdown_after_save, daemon=True).start()
 
     except Exception as exc:
         msg = f"[ERROR] {exc}\n{traceback.format_exc()}"
@@ -431,6 +426,7 @@ def _upload_results(pdf_path, json_path, client_ip, client_name, form_data, log_
     raw_data = quote(json.dumps(form_data or {}, default=str), safe="")
     url = f"{SERVER_URL}/api/client_upload?data={raw_data}"
     MAX_RETRIES = 3
+    last_error = "Database save was not acknowledged"
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -451,14 +447,20 @@ def _upload_results(pdf_path, json_path, client_ip, client_name, form_data, log_
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = _decode_upload_response(resp.read())
                 log_fn(f"  Uploaded PDF+JSON -> device-scan API via server: {result}")
+            if not isinstance(result, dict) or result.get("status") != "ok" or result.get("error"):
+                raise RuntimeError("Server did not acknowledge database save")
             return
 
         except urllib.error.HTTPError as exc:
             detail = _decode_upload_response(exc.read())
+            last_error = str(detail.get("error") or detail) if isinstance(detail, dict) else str(detail)
+            exc.close()
             log_fn(f"  [WARN] Upload PDF+JSON attempt {attempt}/{MAX_RETRIES} failed ({exc.code}): {detail}")
         except urllib.error.URLError as exc:
+            last_error = str(exc)
             log_fn(f"  [WARN] Upload PDF+JSON attempt {attempt}/{MAX_RETRIES} failed (network): {exc}")
         except Exception as exc:
+            last_error = str(exc)
             log_fn(f"  [WARN] Upload PDF+JSON attempt {attempt}/{MAX_RETRIES} failed: {exc}")
 
         if attempt < MAX_RETRIES:
@@ -466,6 +468,16 @@ def _upload_results(pdf_path, json_path, client_ip, client_name, form_data, log_
         else:
             log_fn("  [WARN] Upload PDF+JSON failed after all retries.")
             log_fn(f"  Files still available locally: {pdf_path} | {json_path}")
+            raise RuntimeError(f"Database save failed after all upload attempts: {last_error}")
+
+
+_http_server = None
+
+
+def _shutdown_after_save():
+    time.sleep(2)
+    if _http_server is not None:
+        _http_server.shutdown()
 
 
 class ClientAgentHandler(BaseHTTPRequestHandler):
@@ -576,6 +588,19 @@ class ClientAgentHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
 
+        if path in ("/agent/start", "/agent/stop"):
+            if not self._auth():
+                return
+            with _lock:
+                busy = _state["status"] in ("running", "uploading")
+            if path == "/agent/stop" and busy:
+                self._send_json({"error": "Scan or database save is still running"}, 409)
+                return
+            self._send_json({"status": "running" if path.endswith("start") else "stopped"})
+            if path.endswith("stop"):
+                threading.Thread(target=_shutdown_after_save, daemon=True).start()
+            return
+
         if path == "/run":
             if not self._auth():
                 return
@@ -594,14 +619,12 @@ class ClientAgentHandler(BaseHTTPRequestHandler):
             if not isinstance(form_data, dict):
                 self._send_json({"error": "form_data must be an object"}, 400)
                 return
-            with _lock:
-                status = _state["status"]
-            if status == "running":
-                self._send_json({"status": "already_running"})
-                return
             # Reset state so a fresh scan can start after done/error
             with _lock:
-                _state["status"]    = "idle"
+                if _state["status"] in ("running", "uploading"):
+                    self._send_json({"error": "Scan already running"}, 409)
+                    return
+                _state["status"]    = "running"
                 _state["log"]       = []
                 _state["pdf_path"]  = None
                 _state["json_path"] = None
@@ -683,16 +706,17 @@ def main():
         print(f"\n  [ERROR] {e}\n")
         sys.exit(1)
 
-    # Register with the server
-    print("  Registering with server ...")
+    # Bind before registration: repeated launch clicks must not register a duplicate.
+    global _http_server
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", AGENT_PORT), ClientAgentHandler)
+    except OSError:
+        print("Agent port is already in use; no second agent started.")
+        return
+    _http_server = server
     _register_with_server(local_ip)
-
-    # Background keep-alive
     t = threading.Thread(target=_keep_alive_loop, args=(local_ip,), daemon=True)
     t.start()
-
-    # Start the local HTTP listener
-    server = ThreadingHTTPServer(("0.0.0.0", AGENT_PORT), ClientAgentHandler)
     print(f"\n  Agent listening on port {AGENT_PORT}.  Press Ctrl+C to stop.")
     print(f"  Open {SERVER_URL} in any browser to scan this PC.\n")
 

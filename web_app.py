@@ -64,7 +64,7 @@ SECRET_TOKEN  = "ITC2024CLIENT"   # must match client_agent.py
 AGENT_TIMEOUT = 600            # seconds — long scans can take several minutes
 DEVICE_SCAN_API_URL = os.environ.get(
     "DEVICE_SCAN_API_URL",
-    os.environ.get("REGISTER_API_URL", "http://10.31.3.114:5000/api/device-scan"),
+    os.environ.get("REGISTER_API_URL", "http://10.31.3.114:8000/api/device-scan"),
 )
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -145,6 +145,26 @@ def _call_agent(agent_id: str, method: str, path: str, body=None) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # HTTPError subclasses URLError; classify HTTP responses first.
+        upgrade_required = e.code == 404 and path in ("/agent/start", "/agent/stop")
+        if upgrade_required:
+            message = ("This agent does not support Start/Stop. Download and run the "
+                       "updated installer on this PC, then retry.")
+        else:
+            message = f"Agent request {method} {path} failed (HTTP {e.code})."
+            try:
+                payload = json.loads(e.read())
+                if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+                    message += " " + payload["error"]
+            except (ValueError, OSError):
+                pass
+        e.close()
+        result = {"error": message, "http_status": e.code,
+                  "_transient": e.code in (408, 429, 500, 502, 503, 504)}
+        if upgrade_required:
+            result.update(upgrade_required=True, installer_url="/install/windows")
+        return result
     except urllib.error.URLError as e:
         return {"error": str(e), "_transient": True}
     except Exception as e:
@@ -535,7 +555,7 @@ HTML = r"""<!DOCTYPE html>
     <p style="margin-top:14px;font-size:11.5px;color:#64748B">
       The command downloads and runs <code>deploy_client.py</code> which installs dependencies,
       patches the server URL, starts the agent silently in the background, and installs a
-      startup service so the agent survives reboots — all without any manual steps.
+      Windows launch handler so you can start the agent from this page — all without any manual steps.
     </p>
   </div>
 
@@ -598,7 +618,7 @@ function updateClientBanner() {
     document.getElementById('admin-clients-card').style.display = 'none';
 
     // Auto-select this client for scan controls
-    selectClient(match.agent_id, match.ip, match.hostname);
+    if (selectedAgentId !== match.agent_id) selectClient(match.agent_id, match.ip, match.hostname);
     wrap.innerHTML = '';
   } else {
     // Admin / unregistered view
@@ -617,9 +637,10 @@ function updateClientBanner() {
         <div class="client-banner not-registered" style="flex-direction:column;align-items:flex-start;gap:12px">
           <div style="display:flex;align-items:center;gap:10px">
             <span style="color:#EF4444;font-size:20px">✗</span>
-            <span>Your PC (<strong>${myClientIp}</strong>) does not have the agent installed yet.</span>
+            <span>Your PC (<strong>${myClientIp}</strong>) has no reachable agent. Start an existing installation or install it below.</span>
           </div>
           <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+            <a class="btn btn-success" href="itc-agent://start">Start Agent</a>
             <a href="${serverUrl}/install/windows" id="install-btn"
                style="display:inline-flex;align-items:center;gap:8px;background:#4F6EF7;color:#fff;
                       font-weight:700;font-size:14px;padding:11px 24px;border-radius:8px;
@@ -635,7 +656,7 @@ function updateClientBanner() {
           </div>
           <div style="font-size:10.5px;color:#64748B">
             ✓ Installs silently &nbsp;·&nbsp; ✓ No terminal needed &nbsp;·&nbsp;
-            ✓ Survives reboots &nbsp;·&nbsp; ✓ This page refreshes automatically
+            ✓ Start again from this page &nbsp;·&nbsp; ✓ This page refreshes automatically
           </div>
         </div>`;
     } else {
@@ -643,7 +664,7 @@ function updateClientBanner() {
         <div class="client-banner not-registered" style="flex-direction:column;align-items:flex-start;gap:12px">
           <div style="display:flex;align-items:center;gap:10px">
             <span style="color:#EF4444;font-size:20px">✗</span>
-            <span>Your PC (<strong>${myClientIp}</strong>) does not have the agent installed yet.</span>
+            <span>Your PC (<strong>${myClientIp}</strong>) has no reachable agent. Start an existing installation or install it below.</span>
           </div>
           <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
             <a href="${serverUrl}/install/linux" id="install-btn"
@@ -660,7 +681,7 @@ function updateClientBanner() {
             </div>
           </div>
           <div style="font-size:10.5px;color:#64748B">
-            ✓ Installs silently &nbsp;·&nbsp; ✓ Survives reboots &nbsp;·&nbsp; ✓ This page refreshes automatically
+            ✓ Installs silently &nbsp;·&nbsp; ✓ Start again from this page &nbsp;·&nbsp; ✓ This page refreshes automatically
           </div>
         </div>`;
     }
@@ -690,7 +711,16 @@ async function agentAction(action, agentId, _unused, pillEl, msgEl) {
     const res = await fetch(`/api/${action}_agent/${aid}`, { method: 'POST' });
     const d   = await res.json();
     if (d.error) {
+      if (action === 'start' && !agentId && d._transient) window.location.href = 'itc-agent://start';
       if (lbl) lbl.textContent = '⚠ ' + d.error;
+      if (lbl && d.upgrade_required) {
+        const install = document.createElement('a');
+        install.href = '/install/windows';
+        install.className = 'btn btn-primary btn-small';
+        install.textContent = 'Download & Install Agent';
+        lbl.appendChild(document.createTextNode(' '));
+        lbl.appendChild(install);
+      }
     } else {
       if (lbl) lbl.textContent = action === 'start' ? '✓ Agent started.' : '✓ Agent stopped.';
       if (pill) {
@@ -775,6 +805,7 @@ function selectAndScanMine() {
 }
 
 async function selectClient(agentId, ip, hostname) {
+  if (pollTimer) return;
   selectedAgentId = agentId;
   document.getElementById('scan-target-label').textContent = `${hostname}  (${ip})`;
   document.getElementById('scan-btn').disabled = false;
@@ -867,11 +898,7 @@ async function startScan() {
     clearInterval(pollTimer);
     pollTimer = setInterval(pollClientLog, 1500);
     if (refreshTimer) clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => {
-      appendLog(["[INFO] Interval limit reached. Re-synchronizing page..."]);
-      setTimeout(() => { window.location.reload(); }, 1200);
-    }, 120000);
-    appendLog(["[INFO] Diagnostic pipeline triggered. Safety auto-refresh established for T+2m."]);
+    appendLog(["Scan started. Waiting for scan and database save to finish."]);
   } catch(e) { onScanError(String(e)); }
 }
 
@@ -893,8 +920,10 @@ function pollClientLog() {
   fetch(`/api/client_status/${selectedAgentId}?offset=${logOffset}`)
     .then(r => r.json())
     .then(d => {
-      if (d.log && d.log.length) { appendLog(d.log); logOffset = d.total_lines; }
-      if (d.status === 'done') {
+      if (d.lines && d.lines.length) { appendLog(d.lines); logOffset = d.total_lines; }
+      if (d.status === 'done' && d.database_saved) {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        document.getElementById('status-msg').textContent = 'Scan completed successfully and data saved to the database.';
         clearInterval(pollTimer); pollTimer = null; setDot('done');
         _currentPdfUrl = `/api/client_download/${selectedAgentId}/pdf?inline=1`;
         document.getElementById('scan-progress-wrap').style.display = 'none';
@@ -929,7 +958,7 @@ function checkForResultSilent() {
         document.getElementById('view-pdf-btn').style.opacity = '1';
         document.getElementById('view-pdf-btn').style.cursor = 'pointer';
         document.getElementById('complete-filename').textContent =
-          `📄 ${d.pdf_name}  —  Click "View PDF" to open or "Download PDF" to save.`;
+          `Scan completed successfully and data saved to the database. ${d.pdf_name}`;
         document.getElementById('pdf-modal-title').textContent = `📄 ${d.pdf_name}`;
         document.getElementById('dl-pdf2').dataset.href = `/api/client_download/${selectedAgentId}/pdf`;
         const dlJson2 = document.getElementById('dl-json2');
@@ -959,7 +988,7 @@ document.getElementById('pdf-modal').addEventListener('click', function(e) {
 });
 
 function onScanError(msg) {
-  clearInterval(pollTimer);
+  clearInterval(pollTimer); pollTimer = null;
   document.getElementById('scan-progress-wrap').style.display = 'none';
   document.getElementById('status-msg').textContent = 'Error: ' + msg;
   const btn = document.getElementById('scan-btn');
@@ -1483,21 +1512,6 @@ echo   Server: %SERVER%
 echo ============================================
 echo.
 
-:: ── Step 1: Check if pre-built EXE is available from server ──────────────────
-echo [...] Checking for pre-built EXE from server ...
-set EXEFILE=%TEMP%\itc_client_agent.exe
-powershell -NoProfile -Command "try { Invoke-WebRequest -Uri '%SERVER%/static/client_agent.exe' -OutFile '%EXEFILE%' -UseBasicParsing -ErrorAction Stop; Write-Host '[OK] EXE downloaded.' } catch { Write-Host '[INFO] No pre-built EXE found, will use Python installer.' }"
-
-if exist "%EXEFILE%" (
-    echo [OK] Found pre-built EXE. Running agent directly ^(no Python needed^) ...
-    echo.
-    start "" "%EXEFILE%"
-    echo [OK] Agent started. Open %SERVER% in a browser to scan this PC.
-    timeout /t 5
-    goto :end
-)
-
-:: ── Step 2: Look for Python 3 ─────────────────────────────────────────────────
 echo [...] Looking for Python 3 on this PC ...
 set PYTHON=
 where python >nul 2>nul && (python --version 2>&1 | findstr /i "Python 3" >nul && set PYTHON=python)
@@ -1539,7 +1553,7 @@ if not defined PYTHON (
     :: Refresh PATH in this session
     for /f "tokens=*" %%i in ('powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable(\"Path\",\"Machine\")"') do set SYSPATH=%%i
     for /f "tokens=*" %%i in ('powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable(\"Path\",\"User\")"') do set USRPATH=%%i
-    set PATH=%SYSPATH%;%USRPATH%
+    set PATH=!SYSPATH!;!USRPATH!
 
     :: Re-detect Python after install
     where python >nul 2>nul && (python --version 2>&1 | findstr /i "Python 3" >nul && set PYTHON=python)
@@ -1571,6 +1585,11 @@ echo [OK] Downloaded deploy_client.py
 echo [...] Running deployer ...
 echo.
 %PYTHON% "%TMPFILE%" --server %SERVER%
+if errorlevel 1 (
+    echo [ERROR] Agent installation failed. Review the messages above.
+    pause
+    exit /b 1
+)
 
 :end
 echo.
@@ -1603,7 +1622,7 @@ def serve_static_deploy_file(filename: str):
         abort(403)
 
     _static = {
-        "deploy_client.py":      (_DEPLOY_CLIENT_PY,   "text/x-python"),
+        "deploy_client.py":      (None,   "text/x-python"),
         "bootstrap_client.ps1":  (_BOOTSTRAP_PS1,      "text/plain"),
         "bootstrap_client.sh":   (_BOOTSTRAP_SH,       "text/x-sh"),
         "client_agent.py":       (None, "text/x-python"),
@@ -1617,7 +1636,7 @@ def serve_static_deploy_file(filename: str):
 
     if content_str is not None:
         local_ip   = _get_local_ip()
-        server_url = f"http://10.31.3.114:{PORT}"
+        server_url = request.host_url.rstrip("/")
         content_str = content_str.replace("http://10.31.3.114:5001", server_url)
         return app.response_class(
             response=content_str.encode("utf-8"),
@@ -1641,7 +1660,7 @@ def install_os(os_type: str):
     One-click installer — returns a .bat (Windows) or .sh (Linux/macOS) script.
     """
     local_ip   = _get_local_ip()
-    server_url = f"http://10.31.3.114:{PORT}"
+    server_url = request.host_url.rstrip("/")
 
     if os_type == "windows":
         content = _INSTALL_BAT.replace("__SERVER_URL__", server_url)
@@ -1735,8 +1754,7 @@ def api_scan_client(agent_id: str):
         _client_register_sent.discard(agent_id)
 
     with _client_files_lock:
-        _client_files.clear()
-    _clear_output_dir()
+        _client_files.pop(agent_id, None)
 
     result = _call_agent(agent_id, "POST", "/run", {"form_data": form_data})
     if "error" in result:
@@ -1759,8 +1777,7 @@ def api_start_agent(agent_id: str):
         return jsonify({"error": f"Agent '{agent_id}' not registered or timed out."}), 404
     result = _call_agent(agent_id, "POST", "/agent/start")
     if "error" in result:
-        # Agent is already running (we can reach it), treat as success
-        return jsonify({"status": "running", "note": "Agent is reachable — already running."})
+        return jsonify(result), 502
     return jsonify({"status": "started", **result})
 
 
@@ -1776,11 +1793,10 @@ def api_stop_agent(agent_id: str):
     if not agent:
         return jsonify({"error": f"Agent '{agent_id}' not registered or timed out."}), 404
     result = _call_agent(agent_id, "POST", "/agent/stop")
-    # Remove from registry regardless of whether the call succeeded
+    if "error" in result:
+        return jsonify(result), 502
     with _agents_lock:
         _agents.pop(agent_id, None)
-    if "error" in result and not result.get("_transient"):
-        return jsonify({"status": "error", "detail": result["error"]}), 500
     return jsonify({"status": "stopped"})
 
 
@@ -1788,12 +1804,17 @@ def api_stop_agent(agent_id: str):
 
 @app.route("/api/client_status/<agent_id>")
 def api_client_status(agent_id: str):
+    with _client_form_data_lock:
+        saved = agent_id in _client_register_sent
+    if saved:
+        return jsonify({"status": "done", "database_saved": True,
+                        "lines": [], "total_lines": 0, "error": ""})
     offset = int(request.args.get("offset", 0))
     result = _call_agent(agent_id, "GET", f"/status?offset={offset}")
-    if "error" in result:
+    if result.get("error") and result.get("status") != "error":
         with _agents_lock:
             agent_known = agent_id in _agents
-        if agent_known:
+        if agent_known and result.get("_transient"):
             return jsonify({
                 "status":      "running",
                 "lines":       [],
@@ -1819,16 +1840,9 @@ def api_client_status(agent_id: str):
                 entry.setdefault("pdf_remote",  pdf_path)
             if json_path:
                 entry.setdefault("json_remote", json_path)
-        if result.get("status") == "done":
-            def _forward_from_status():
-                forward_result = _client_upload_forward_saved_files(agent_id)
-                if forward_result:
-                    print(f"Register forward from status for {agent_id}: {forward_result}")
-
-            threading.Thread(target=_forward_from_status, daemon=True).start()
 
     return jsonify({
-        "status":      result.get("status", "running"),
+        "status":      "uploading" if result.get("status") == "done" else result.get("status", "running"),
         "lines":       lines,
         "total_lines": total_lines,
         "error":       result.get("error", ""),
@@ -1981,6 +1995,10 @@ def _client_upload_forward_to_device_scan(fields: dict, files: list):
                 resp.read(),
             )
             print(f"DEVICE_SCAN_API_URL response {resp.getcode()}: {payload}")
+            if resp.getcode() == 202 or (isinstance(payload, dict) and
+                    (payload.get("error") or payload.get("success") is False or
+                     payload.get("status") in ("error", "failed", "pending"))):
+                return 502, payload, "Device-scan service did not confirm database save"
             return resp.getcode(), payload, None
     except urllib.error.HTTPError as exc:
         payload = _client_upload_decode_response(
@@ -1993,7 +2011,12 @@ def _client_upload_forward_to_device_scan(fields: dict, files: list):
         # A Node/Multer server can reset the socket while parsing a multipart
         # body.  It is an upstream failure, not an unhandled Flask error.
         print(f"DEVICE_SCAN_API_URL connection failed: {exc}")
-        return 502, {"detail": str(exc)}, "Device-scan service connection failed"
+        message = (
+            "Scan completed, but data could not be saved to the database: "
+            "the device-scan API is unreachable. Ask the administrator to start "
+            "the backend service and verify DEVICE_SCAN_API_URL. Reports are retained."
+        )
+        return 502, {"detail": str(exc)}, message
 
 
 def _client_upload_fetch_agent_file(agent_id: str, ftype: str, target_name: str = ""):
@@ -2148,16 +2171,14 @@ def api_client_upload_device_scan():
     if missing:
         return jsonify({"error": f"Device-scan requires: {', '.join(missing)}"}), 400
 
-    _clear_output_dir()
-    pdf_path = OUTPUT_DIR / pdf_name
-    json_path = OUTPUT_DIR / json_name
+    scan_dir = OUTPUT_DIR / uuid.uuid4().hex
+    scan_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = scan_dir / pdf_name
+    json_path = scan_dir / json_name
     with open(pdf_path, "wb") as pdf_fh:
         pdf_fh.write(pdf_bytes)
     with open(json_path, "wb") as json_fh:
         json_fh.write(json_bytes)
-
-    with _client_files_lock:
-        _client_files.clear()
 
     agent_id = request.headers.get("X-Agent-ID", "").strip()
     if agent_id:
@@ -2185,6 +2206,8 @@ def api_client_upload_device_scan():
     if agent_id:
         with _client_form_data_lock:
             _client_register_sent.add(agent_id)
+    with _agents_lock:
+        _agents.pop(agent_id, None)
     response["status"] = "ok"
     return jsonify(response), status_code
 
